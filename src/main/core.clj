@@ -5,13 +5,13 @@
             [clojure.core.async :as async :refer [chan go-loop <! >! thread timeout go]])
   (:import (java.util.concurrent LinkedBlockingQueue)))
 
-(def EXPLORE_BUFFER_SIZE 20)
+(def EXPLORE_BUFFER_SIZE 4)
 (def WORD_SIZE 3500)
 (def EXPLORE_STEP 10)
 (def EXPLORE_SPEP_SMALL 2)
-(def DIG_BUFFER_SIZE 2)
+(def DIG_THREADS 2)
 (def MIN_AMOUNT 3)
-(def DIG_TIMEOUT_EMITTER 1000)
+(def LICENSE_TIMEOUT 50)
 
 (def base-url (str "http://" (or (System/getenv "ADDRESS") "localhost") ":8000"))
 
@@ -22,7 +22,9 @@
                           {:as :json
                            :content-type :json
                            :accept :json
-                           :body (json/encode data)})
+                           :body (json/encode data)
+                           :retry-handler (fn [ex try-count http-context]
+                                            (if (> try-count 2) false true))})
         result (:body resp)]
     result))
 
@@ -38,19 +40,36 @@
   ([]
    (buy-license []))
   ([data]
-   (post-req "licenses" data)))
+   (try+
+    (post-req "licenses" data)
+    (catch [:status 504] _
+      nil)
+    (catch [:status 503] _
+      nil)
+    (catch [:status 502] _
+      nil)
+    (catch Object _
+      (println "license:" &throw-context)))))
 
 (defn dig [data]
   (try+
    (post-req "dig" data)
    (catch [:status 404] _
-       nil)))
+     nil)
+   (catch Object _
+     (println "dig:" &throw-context))))
 
 (defn explore [data]
   (post-req "explore" data))
 
 (defn cash [data]
-  (post-req "cash" data))
+  (try+
+   (post-req "cash" data)
+   (catch [:status 503] _
+     nil
+     )
+   (catch Object _
+     (println "cash:" &throw-context))))
 
 (defn get-licenses []
   (get-req "licenses"))
@@ -71,24 +90,14 @@
 
   )
 
-(def exit-ch1 (chan))
-(def exit-ch2 (chan))
-(def exit-ch3 (chan))
-(def exit-ch4 (chan))
-(def exit-ch5 (chan))
-(def exit-ch6 (chan))
-(def exit-ch7 (chan))
-
-(def *word-map (atom {}))
 (def *licenses (atom {}))
-; {amount [areas...]}
 (def *amount-big-areas-map (atom (sorted-map-by >)))
 (def *amount-small-areas-map (atom (sorted-map-by >)))
 (def *amount-single-areas-map (atom (sorted-map-by >)))
 (def ch-coord1 (chan EXPLORE_BUFFER_SIZE))
 (def ch-coord2 (chan EXPLORE_BUFFER_SIZE))
-(def ch-coord3 (chan EXPLORE_BUFFER_SIZE))
-(def *ex ( atom []))
+(def *treasures (atom {}))
+(def *ex ( atom {}))
 (def *stat (atom {}))
 
 (defstruct area :posX :posY :sizeX :sizeY)
@@ -96,7 +105,10 @@
 
 (defn save-exception
   [e tag]
- (swap! *ex conj (str tag ":" (.getMessage e))))
+  (swap! *ex
+         assoc
+         (str tag ":" (.getMessage e))
+         (fnil inc 0)))
 
 (defn expired-license?
   [[id license]]
@@ -110,9 +122,7 @@
       (doseq [x (range posX (+ posX sizeX) step)
               y (range posY (+ posY sizeY) step)]
         (let [r (struct report (struct area x y step step))]
-          (>! ch r))))
-;    (swap! *stat assoc (str "step" step ":") (- (System/currentTimeMillis) begin-time))
-    ))
+          (>! ch r))))))
 
 (defn <-area-queue
   [*amount-area-map]  
@@ -126,14 +136,15 @@
 
 (defn ->area-queue
   [*amount-areas-map report]
-  (swap! *amount-areas-map
-         (fn [m amount area]
-           (let [queue (or (m amount) (java.util.concurrent.LinkedBlockingQueue.))
-                 _     (.add queue area)
-                 m     (assoc m amount queue)]
-             m))         
-         (:amount report)
-         report))
+  (when (> (:amount report) 0)
+    (swap! *amount-areas-map
+           (fn [m amount area]
+             (let [queue (or (m amount) (java.util.concurrent.LinkedBlockingQueue.))
+                   _     (.add queue area)
+                   m     (assoc m amount queue)]
+               m))
+           (:amount report)
+           report)))
 
 (defn remove-expired-licenses []
   (when-let [ids-to-delete (seq (->> @*licenses
@@ -160,47 +171,32 @@
   )
 
 (defn start-go-loops []
-  (let [*wait-monitor (atom 0)]
-    (go-loop []
-      (async/alt!
-        exit-ch5
-        ([_] (println "exit-ch5"))
-        (timeout 100)
-        ([_]
-         (remove-expired-licenses)
-         (swap! *wait-monitor dec-monitor)
-         (when (and (monitor<=0? *wait-monitor)
-                    (< (count @*licenses) 3))
-           (try
-             (let [license (buy-license)]
-               (swap! *licenses assoc (:id license) license))
-             (catch Exception e
-               (swap! *wait-monitor + 10)
-;               (save-exception e "license")
-               )))
-         (recur)))))
 
-  (go-loop []    
-    (async/alt!
-      exit-ch1
-      ([_] (println "exit-ch1"))
-      ch-coord1
-      ([{:keys [area]}]
-       (try
-         (let [report (explore area)]
-           (when (>= (:amount report) MIN_AMOUNT)
-             (->area-queue *amount-big-areas-map report)))
-         (catch Exception e
-           (save-exception e "ch-coord1")))
-       (recur))))
+  (thread
+    (loop []
+      (remove-expired-licenses)
+      (when (< (count @*licenses) 10)
+        (when-some [license (buy-license)]
+          (swap! *stat update :lic-count (fnil inc 0))
+          (swap! *licenses assoc (:id license) license))
+        (Thread/sleep LICENSE_TIMEOUT))
+      (recur)))
+
+  (go-loop []
+    (let [{:keys [area]} (<! ch-coord1)]
+     (try
+       (let [report (explore area)]
+         (when (>= (:amount report) MIN_AMOUNT)
+           (->area-queue *amount-big-areas-map report)))
+       (catch Exception e
+         (save-exception e "ch-coord1")))
+     (recur)))
 
   (let [*current-buffer-size (atom 0)
         max-buffer-step-size 25]
     (thread
       (loop []
         (async/alt!!
-          exit-ch3
-          ([_] (println "exit-ch3"))
           (timeout 10)
           ([_]
            (when (< @*current-buffer-size max-buffer-step-size)
@@ -212,53 +208,27 @@
            (recur)))))
 
     (go-loop []
-      (async/alt!
-        exit-ch4
-        ([_] (println "exit-ch4"))
-        ch-coord2
-        ([{:keys [area]}]
+      (let [{:keys [area]} (<! ch-coord2)]
          (try
            (let [report (explore area)]
-             (when (> (:amount report) 0)
-               (->area-queue *amount-small-areas-map report)))
+             (->area-queue *amount-small-areas-map report))
            (catch Exception e
              (save-exception e "ch-coord2")))
            (swap! *current-buffer-size dec-monitor)
-         (recur)))))
+           (recur))))
 
-  (let [*current-buffer-size (atom 0)
-        max-buffer-step-size 4]
-    (thread
-      (loop []
-        (async/alt!!
-          exit-ch6
-          ([_] (println "exit-ch6"))
-          (timeout 10)
-          ([_]
-           (when (< @*current-buffer-size max-buffer-step-size)
-             (when-some [report (<-area-queue *amount-small-areas-map)]
-               (swap! *current-buffer-size + max-buffer-step-size)
-               (send-coords ch-coord3
-                            report
-                            1)))
-           (recur)))))
-
-    (go-loop []
-      (async/alt!
-        exit-ch7
-        ([_] (println "exit-ch7"))
-        ch-coord3
-        ([{:keys [area]}]
-         (try
-           (let [report (explore area)]
-             (when (> (:amount report) 0)               
-               (->area-queue *amount-single-areas-map report)))
-           (catch Exception e
-             (save-exception e "ch-coord2")))
-           (swap! *current-buffer-size dec-monitor)
-         (recur)))))
-
-                                        ;gets amount small area and dig while amount 0 or level 10
+  (go-loop []
+    (when-some [{:keys [amount area]} (<-area-queue *amount-small-areas-map)]
+      (let [{:keys [posX posY sizeX sizeY]} area
+            *total-amount (atom amount)]
+        (doseq [x (range posX (+ posX sizeX))
+                y (range posY (+ posY sizeY))]
+          (when (> @*total-amount 0)
+            (when-some [report (explore {:posX x :posY y :sizeX 1 :sizeY 1})]
+              (->area-queue *amount-single-areas-map report)
+              (swap! *total-amount - (:amount report))))
+          )))
+    (recur))
 
   (defn dig-dig
     [{:keys [amount area]}]
@@ -266,67 +236,64 @@
            amount amount]
       (if (or (== 0 amount)
               (> depth 10))
-        nil
-        (let [id (get-licence-id)]
-          (if id
-            (let [resp     (dig {:licenseID id
-                                 :posX (:posX area)
-                                 :posY (:posY area)
-                                 :depth depth})
-                  _        (swap! *licenses update-in [id :digUsed] inc)
-                  _        (println resp)
-                  remain   (if (nil? resp)
-                             amount
-                             (dec amount))]
-              (recur (inc depth)
-                     remain))
-            (recur depth
-                   amount))))))
-
-      
-;      (let [license-id (get-licence-id)]
-;        (if license-id
-;          (let [resp         (dig {:licenseID license-id                                   
-;                                   :posX (:posX area)
-;                                   :posY (:posY area)
-;                                   :depth depth})
- ;               remaining-amount (if (nil? resp) a (dec a))]
-;            (swap! *licenses update-in [license-id :digUsed] inc)
-;            (println "dig>>>" resp)
-;            (when (and (< depth 10) (> remaining-amount 0))
-;              (recur (inc depth) remaining-amount))))
-;        (recur depth a))))
+        nil        
+        (if-let [id (get-licence-id)]
+          (let [resp     (dig {:licenseID id
+                               :posX (:posX area)
+                               :posY (:posY area)
+                               :depth depth})
+                _        (swap! *licenses update-in [id :digUsed] inc)
+;                _        (swap! *stat update :dig-count (fnil inc 0))
+;                _        (println resp)
+                remain   (if (nil? resp)
+                           amount
+                           (do
+                             (swap! *treasures (partial apply assoc) (interleave resp (repeat 1)))
+                             (swap! *stat update :dig-count (fnil inc 0))
+                             (dec amount)))]
+            (recur (inc depth)
+                   remain))
+          (recur depth
+                 amount)))))
+  
+  (go-loop []
+    (when-some [report (<-area-queue *amount-single-areas-map)]
+      (dig-dig report))
+    (recur))
 
   (thread
     (loop []
-      (when-some [report (<-area-queue *amount-single-areas-map)]
-        ;(println "explore>" (explore (:area report)))
-        ;(println report)
-        (dig-dig report))
-      (Thread/sleep 5000)
+      (when-some [tr (first @*treasures)]
+;        (println tr)
+        (let [[id _] tr
+              _    (swap! *treasures dissoc id)
+              resp (cash id)]
+          (Thread/sleep 100)
+          ))        
       (recur)))
-  
+
 
   (go-loop []
     (async/alt!
-      exit-ch2
-      ([_] (println "exit-ch2"))
-      (timeout 20000)
+      (timeout 10000)
       ([_]
        (doseq [line (partition-all 6 @*stat)]
          (println line))
        (when (seq @*ex)
          (println @*ex))
-;       (println (- (System/currentTimeMillis) begin-time))
+       (println "threasures:" (count @*treasures))
+       (println "licenses:" (count @*licenses))
+       (println (- (System/currentTimeMillis) begin-time) "ms")
        (recur)))))
   
+
 
 (defn main [& opts]
   (println  "STEP:" EXPLORE_STEP
             "EXPLORE_BSz" EXPLORE_BUFFER_SIZE
-            "DIG_BSz" DIG_BUFFER_SIZE
+            "DIG_THs" DIG_THREADS
             "MIN_AMOUNT" MIN_AMOUNT
-            "DIG_TIMEOUT" DIG_TIMEOUT_EMITTER)
+            "LICENSETIMEOUT" LICENSE_TIMEOUT)
 
   (start-go-loops)
   
@@ -340,20 +307,9 @@
              (Thread/sleep 1000000)
              (recur))))
 
-(defn stop []
-  (go (>! exit-ch1 1))
-  (go (>! exit-ch2 1))
-  (go (>! exit-ch3 1))
-  (go (>! exit-ch4 1))
-  (go (>! exit-ch5 1))
-  (go (>! exit-ch6 1))
-  (go (>! exit-ch7 1)))
-
- 
 (comment
   (main)
 
-  (stop)
 
   (let [r (async/alt!!
             (timeout 1000) ([_] 1)
