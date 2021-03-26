@@ -1,106 +1,138 @@
 (ns core
   (:require [clj-http.client :as client]
             [cheshire.core :as json]
-            [slingshot.slingshot :as sl :refer [throw+ try+]]
-            [clojure.core.async :as async :refer [chan go-loop <! >! thread timeout go]])
+            [slingshot.slingshot :as sl :refer [throw+ try+]])
   (:import (java.util.concurrent LinkedBlockingQueue)))
 
 (def base-url (str "http://" (or (System/getenv "ADDRESS") "localhost") ":8000"))
 
-(def STEP1 20)
+;(def cm (clj-http.conn-mgr/make-reusable-conn-manager {:timeout 1000 :threads 16}))
+
+(def STEP1 16)
+(def WORD_SIZE 3488)
 (def CASH_PARALLELS 2)
-(def EXPLORE1_PARALLELS 2)
-(def EXPLORE2_PARALLELS 8)
+(def EXPLORE_PARALLELS 4)
 (def DIG_PARALLELS 4)
+(def MIN_AMOUNT 6)
+(def LICENSES_TIMEOUT 10)
+(def CONNECTION_TIMEOUT 10)
+(def RPS 950)
+(def *rps-counter (atom 0))
 
-(defn <-area-queue
-  [*amount-area-map]
-  (let [queue (->> @*amount-area-map
-                   (filter (fn [[amount ^LinkedBlockingQueue queue]]
-                             (not (.isEmpty queue))))
-                   (map (fn [[_ q]] q))
-                   (first))]
-    (when queue
-      (.poll ^LinkedBlockingQueue queue))))
+(def *reports-queue (LinkedBlockingQueue.))
+(defn add-report [report]
+  (.add *reports-queue report))
+(defn poll-report []
+  (.poll ^LinkedBlockingQueue *reports-queue))
+(defn report-queue-not-full? []
+  (<= (count *reports-queue) 4))
 
-(defn ->area-queue
-  [*amount-areas-map report]
-  (when (> (:amount report) 0)
-    (swap! *amount-areas-map
-           (fn [m amount area]
-             (let [queue (or (m amount) (java.util.concurrent.LinkedBlockingQueue.))
-                   _     (.add queue area)
-                   m     (assoc m amount queue)]
-               m))
-           (:amount report)
-           report)))
+(def *reports-dig-queue (LinkedBlockingQueue.))
+(defn add-report-dig [report]
+  (.add *reports-dig-queue report))
+(defn poll-report-dig []
+  (.poll ^LinkedBlockingQueue *reports-dig-queue))
 
-(def beging-time (System/currentTimeMillis))
+(def *treasures-queue (LinkedBlockingQueue.))
+(defn add-treasure [treasure]
+  (.add *treasures-queue treasure))
+(defn poll-treasure []
+  (.poll ^LinkedBlockingQueue *treasures-queue))
 
-(defn getreq [path]
-  (try
-    (println "path:" path)
-    (let [resp (client/get (str base-url "/" path)
-                           {:as :json
-                            :content-type :json
-                            :retry-handler (fn [ex try-count http-context]
-                                             (if (> try-count 2) false true))
-                            :accept :json})]
-      (println "resp:" resp)
-      (:body resp))
-    (catch Exception e
-      [])))
+(defn getreq [path {:keys [success raise]}]
+  (client/get (str base-url "/" path)
+              {:as :json
+               :content-type :json
+               :async? true
+               :accept :json}
+              success
+              raise))
 
-(defn postreq [path data success raise]
-  (client/post (str base-url path)
-               {:as :json
-                :content-type :json
-                :accept :json
-                :socket-timeout 10
-                :connection-timeout 10
-                :body (json/encode data)
-                :async? true}
-               success
-               raise))
+(comment
+  (clojure.pprint/pprint @*licenses)
+  (getreq "licenses"
+          {:success (fn [{:keys [body]}]
+                      (println body))
+           :raise (fn [er]
+                    (println er))}))
 
-(defn postreq-explore [data success raise]
+(def *request-count (atom 0))
+
+
+;(future
+;  (loop []
+    
+
+;    (recur)))
+
+(defn postreq
+  [path {:keys [data success raise timeout]
+         :or {timeout 1000
+              raise println
+              success println}}]
+;  (Thread/sleep 10)
+;;  (loop []
+;    (when (< @*rps-counter))
+
+;    (recur))
+  (swap! *request-count inc)
+  (let [future (client/post (str base-url path)
+                            {:as :json
+                             :content-type :json
+                             :accept :json
+                             :body (json/encode data)
+                             :async? true
+                             :oncancel (fn [& a] (raise :timeout))}
+                            success
+                            raise)]
+;;    (try
+;;      (.get future timeout java.util.concurrent.TimeUnit/MILLISECONDS)
+;;      (catch java.util.concurrent.TimeoutException e
+;;        (swap! *rps-counter dec)
+;;        (println "cancelled" path)
+;;        (.cancel future true)))
+    ))
+
+(defn postreq-explore
+  [opts]
   (postreq "/explore"
-           data
-           success
-           (fn [ex]
-             (postreq "/explore"
-                      data
-                      success
-                      raise))))
+           opts))
 
-(defn postreq-dig [data success raise]
-  (postreq "/dig" data success raise))
+(defn postreq-dig
+  [opts]
+  (postreq "/dig"
+           opts))
 
-(defn postreq-license [data success raise]
-  (postreq "/licenses" data success raise))
+(defn postreq-license
+  [opts]
+  (postreq "/licenses"
+           (assoc opts :timeout 2000)))
 
-(defn postreq-cash [data success raise]
+(defn postreq-cash
+  [opts]
   (postreq "/cash"
-           data
-           success
-           (fn [ex]
-             (postreq "/cash"
-                      data
-                      success
-                      raise))))
+           opts))
 
-(def *licenses (atom {}))
+(def *licenses (ref {}))
+(def *licenses-for-refresh (ref {}))
 (def *coins (atom '()))
-(def *explore-reports-map (atom (sorted-map-by >)))
-(def *explore-reports-for-dig (atom (sorted-map-by >)))
 (def *stat (atom {}))
 (def *cache-thread-licenses (ref {}))
+(def *license-price (atom 0))
+(def *phase (atom "EXPLORE"
+                  :validator #{"EXPLORE" "DIG" "CASH"}))
+(defn explore-phase? []
+  (= "EXPLORE" @*phase))
+(defn dig-phase? []
+  (= "DIG" @*phase))
+(defn cash-phase? []
+  (= "CASH" @*phase))
 
 (comment
   (count @*licenses)
   (count @*coins)
-
-  )
+  (count *reports-queue)
+  (count *reports-dig-queue))
 
 (defn expired-license?
   [[id license]]
@@ -111,18 +143,19 @@
   (when-let [ids-to-delete (seq (->> @*licenses
                                      (filter expired-license?)
                                      (map #(first %))))]
-    (swap! *licenses (partial apply dissoc) ids-to-delete)))
+    (dosync
+     (alter *licenses (partial apply dissoc) ids-to-delete))))
 
-(defn get-license-id []
+(defn get-license []
   (remove-expired-licenses)
   (let [thread-name (.getName (Thread/currentThread))]
     (dosync
-     (alter *cache-thread-licenses dissoc thread-name)     
+     (alter *cache-thread-licenses dissoc thread-name)
      (let [busy-license-ids (into #{} (vals @*cache-thread-licenses))
            unbusy-license-id   (->> @*licenses
-                                 (filter (fn [[k v]] (not (busy-license-ids k))))
-                                 (first)
-                                 (first))]
+                                    (filter (fn [[k v]] (not (busy-license-ids k))))
+                                    (first)
+                                    (second))]
        (alter *cache-thread-licenses assoc thread-name unbusy-license-id)
        unbusy-license-id))))
 
@@ -130,220 +163,271 @@
   ([]
    (buy-license-promise []))
   ([data]
-   (let [result (promise)]
-     (postreq-license data
-                      (fn [{:keys [status body request-time]}]
-                        (deliver result (assoc body :request-time request-time)))
-                      (fn [ex]
-                        (let [tho (slingshot.slingshot/get-thrown-object ex)
-                              status (:status tho)]
-                          (deliver result nil))))
+   (let [result (promise)]     
+     (postreq-license {:data data
+                       :success (fn [{:keys [status body request-time]}]
+;                                  (println "111")
+                                  (deliver result (assoc body :request-time request-time)))
+                       :raise (fn [ex]
+;                                (println ex)
+                                (let [tho (slingshot.slingshot/get-thrown-object ex)
+                                      status (:status tho)]
+                                  (deliver result nil)))})
      result)))
 
-(defn dig [{:keys [total-amount posX posY]} ch]
+(comment
+  @(buy-license-promise [])
+
+  )
+
+(defn update-average-time [key time]
+;  (println key "--" time)
+;  (let [key_count (str key "count")
+;        new-count ((swap! *stat update key_count (fnil inc 0)) key_count)
+;        current-average-time (get @*stat key 0)
+;        new-average-time (float (/ (+ time (* current-average-time (dec new-count))) new-count))]
+;    (swap! *stat assoc key new-average-time)    
+;    )
+  )
+
+(defn dig [{:keys [total-amount posX posY]} *monitor]
   (loop [depth             1
          remaining-amount total-amount]
     (when (and (< depth 11) (> remaining-amount 0))
-      (if-let [license-id (get-license-id)]
-        (let [result  (promise)]
-          (postreq-dig {:licenseID license-id
-                        :posX posX
-                        :posY posY
-                        :depth depth}
-                       (fn [{:keys [status body request-time]}]
-                                        ;                         (println "dig:" depth "->" request-time)
-                         (swap! *stat update (str "dig" depth) #(float (/ (+ (or % request-time) request-time) 2)))
-                         (swap! *stat update :treasure-count (fnil inc 0))
-                         (deliver result {:status status
-                                          :body body}))
-                       (fn [ex]
-                         (let [tho (slingshot.slingshot/get-thrown-object ex)]
-                           (deliver result tho))))
-          (let [{:keys [status body]} @result]
+
+      (if-let [license (get-license)]
+        (if (and (:free license) (> depth 6))
+          nil
+          
+        (let [result  (promise)
+              license-id (:id license)]
+          (swap! *monitor inc)
+          (postreq-dig {:data {:licenseID license-id
+                               :posX posX
+                               :posY posY
+                               :depth depth}
+                        :success (fn [{:keys [status body request-time]}]
+                                   (deliver result
+                                            {:status status
+                                             :request-time request-time
+                                             :body body}))
+                        :raise (fn [ex]
+                                 (if (= :timeout ex)
+                                   (deliver result {:status :timeout})
+                                   (let [tho (slingshot.slingshot/get-thrown-object ex)]
+                                     (deliver result tho))))})
+          (let [{:keys [status body request-time]} @result]
+            (swap! *monitor dec)
             (cond
               (nil? status) nil
-              (== 200 status) (do
-                                (swap! *licenses update-in [license-id :digUsed] inc)
-                                (doseq [treasure-id body]
-                                  (async/put! ch {:id treasure-id
-                                                  :depth depth}))
-                                (recur (inc depth) (- remaining-amount (count body))))
-              (== 404 status) (do
-                                (swap! *licenses update-in [license-id :digUsed] inc)
-                                (recur (inc depth) remaining-amount))
+              (= :timeout status) (dosync
+                                   (alter *licenses dissoc license-id)
+                                   (alter *licenses-for-refresh assoc license-id license))
+              (= 200 status) (do
+                               (update-average-time (format "dig[%s]" depth) request-time)
+                               (dosync
+                                (alter *licenses update-in [license-id :digUsed] inc))
+
+                               (doseq [treasure-id body]
+                                 (add-treasure {:id treasure-id
+                                                :depth depth}))
+                               (recur (inc depth) (- remaining-amount (count body))))
+              (= 404 status) (do
+                               (update-average-time (format "dig[%s]" depth) request-time)
+                               (dosync
+                                (alter *licenses update-in [license-id :digUsed] inc))
+
+                               (recur (inc depth) remaining-amount))
+              (= 403 status) (do
+                               ;(recur depth remaining-amount)
+                               )
               :default        (do
                                 (println "repead dig status " status)
-                                (recur depth remaining-amount)))))
+                                (recur depth remaining-amount))))))
         (recur depth remaining-amount)))))
-
-(def *licenses-price-stat (atom (sorted-map)))
-(def *last-price (atom 0))
-
-(def get-price (fn []
-                        (if (> (count @*licenses-price-stat) 50)
-                          (let [[rate price] (first @*licenses-price-stat)]
-                            price)
-                          @*last-price)))
-
-
 
 (defn print-stat []
   (future
     (loop []
-      (Thread/sleep (* 1000 60))
-      (println "license price:" (get-price))
+      (Thread/sleep (* 1000 10))
       (println "licenses count:" (count @*licenses))
-      (clojure.pprint/pprint @*licenses)
-      (println "map for dig" *explore-reports-for-dig)
-      (clojure.pprint/pprint @*stat)      
+      (println "licenses for recover:" (count @*licenses-for-refresh))
+      (println "reports count:" (count *reports-queue))
+      (println "treasures count:" (count *treasures-queue))
+      (println "digreports count:" (count *reports-dig-queue))
+      (println "licenses price:" @*license-price)
+;      (clojure.pprint/pprint @*licenses)
+      (clojure.pprint/pprint @*stat)
       (recur))))
 
-(comment
-  (get-price)
-  (println @*licenses-price-stat)
-  (count @*licenses-price-stat)
-  (== 200 nil)
-  )
-
-
-
 (defn run []
-  (let [ch-areas (chan 10)
-        ch-reports (chan 10)
-        ch-reports-finish (chan 10)
-        ch-treasures (chan 10)
-       ]
+  (future
+    (loop []
+      (let [dig-queue-length (count *reports-dig-queue)]
+        (cond
+          (explore-phase?)
+          (when (> dig-queue-length 100)
+            (swap! *phase (constantly "DIG")))
+          (dig-phase?)
+          (when (<= dig-queue-length 1)
+            (swap! *phase (constantly "EXPLORE")))
 
-    (thread
-      (let [update-stat (fn [coins license]
-                          (when-not (> (count @*licenses-price-stat) 50)                            
-                            (when (= (count coins) @*last-price)
-                              (swap! *last-price inc))
-                            (when (> (count coins) 0)
-                              (swap! *licenses-price-stat
-                                     assoc
-                                     (- (* 1000 (/ (:digAllowed license) (count coins)))
-                                        (:request-time license))                                     
-                                     (count coins)))))]
-        (loop []
-          (remove-expired-licenses)
-          (when (< (count @*licenses) 10)
-            (let [price (get-price)
+         ; (dig-phase?)
+         ; (when (zero? dig-queue-length)
+         ;   (swap! *phase (constantly "CASH")))
+         ; (cash-phase?)
+         ; (when (zero? (count *treasures-queue))
+         ;   (swap! *phase (constantly "EXPLORE")))
+          ))
+      (Thread/sleep 500)
+      (recur)))
+
+  (future
+    (loop []
+      (Thread/sleep 1000)
+      (when (> (count @*licenses-for-refresh) 0)
+        (let [p (promise)]
+          (getreq "licenses"
+                  {:success (fn [{:keys [body]}]
+                              (dosync
+                               (let [licenses-tmp @*licenses-for-refresh]
+                                 (ref-set *licenses-for-refresh {})
+                                 (doseq [license  body]
+                                   (when (get licenses-tmp (:id license))
+                                     (update-in licenses-tmp
+                                                [(:id license) :digUsed]
+                                                (constantly (:digUsed license)))))
+                                 (alter *licenses merge licenses-tmp)
+                                 (deliver p true))))
+                   :raise (fn [er]
+                            (println "get-licenses:" (.getMessage er))
+                            (deliver p true))})
+          @p))
+      (recur)))
+
+  (future
+    (let [*count (atom 0)]
+      (loop []
+        (remove-expired-licenses)
+        (let [licenses-count (count @*licenses)]
+          (when (and
+                 (< @*license-price 25)
+                 (< licenses-count 5)
+                 (> @*count 10))
+            (reset! *count 0)
+            (swap! *license-price inc))
+          (when (< licenses-count 10)
+            (let [price @*license-price
                   coins (take price @*coins)
                   _     (swap! *coins #(drop price %))]
               (when-some [license @(buy-license-promise coins)]
-                (swap! *licenses assoc (:id license) license)
-                (update-stat coins license)))
-            )
-          
-          ;(Thread/sleep 5000)
-          (recur))))
+                (let [coins-count (count coins)]
+                  (dosync
+                   (alter *licenses assoc (:id license) (assoc license :free (zero? coins-count))))
+                  (swap! *stat update "sum license price:" (fnil + 0) coins-count)
+                  (when (= price coins-count)
+                    (swap! *count inc)))
 
-    (async/pipeline-async EXPLORE1_PARALLELS
-                          ch-reports
-                          (fn [area ch]
-                            (postreq-explore area
-                                             (fn [{:keys [body]}]
-                                               (go
-                                                 (when (> (:amount body) 1)
-                                                   (>! ch body))
-                                                 (async/close! ch)))
-                                             (fn [ex]
-                                            ;   (let [tho (slingshot.slingshot/get-thrown-object ex)]
-                                            ;     (println "explore= status:" (:status tho) "message:" (:message tho)))
-                                               (async/close! ch))))
-                          ch-areas)
+                (Thread/sleep LICENSES_TIMEOUT)))))
+        (recur))))
 
-    (go
-      (doseq [x (range 0 3500 STEP1)
-              y (range 0 3500 STEP1)]
-        (>! ch-areas {:posX x :posY y :sizeX STEP1 :sizeY STEP1})))
+  (future
+    (let [areas (for [x (range 0 WORD_SIZE STEP1)
+                      y (range 0 WORD_SIZE STEP1)]
+                  {:posX x :posY y :sizeX STEP1 :sizeY STEP1})
+          start (fn [area]
+                  (postreq-explore {:data area
+                                    :success (fn [{:keys [body]}]
+                                               (when (>= (:amount body) MIN_AMOUNT)
+                                                 (add-report body)))}))]
+      (loop [areas areas]
+        (if (and (explore-phase?)
+                 (report-queue-not-full?))
+          (do
+            (start (first areas))
+            (recur (rest areas)))
+          (do
+            (Thread/sleep 10)
+            (recur areas))))))
 
-    (go-loop []
-      (when-some [report (<! ch-reports)]
-        (->area-queue *explore-reports-map
-                      report)
-        (recur)))
-
-    (go-loop []
-      (if-let [report (<-area-queue *explore-reports-map)]
-        (let [{:keys [amount area]} report
-              startX                (:posX area)
-              startY                (:posY area)
-              ch-areas              (chan 10)
-              *total-amount         (atom amount)
-              handler               (fn [area ch]
-                                      (if (<= @*total-amount 0)
-                                        (async/close! ch)
-                                        (postreq-explore area
-                                                         (fn [{:keys [body]}]
-                                                           (go
-                                                             (when (> (:amount body) 0)
-                                                               (swap! *total-amount - (:amount body))
-                                                               (>! ch body))
-                                                             (async/close! ch)))
-                                                         (fn [ex]
-                                                          ; (let [tho (slingshot.slingshot/get-thrown-object ex)]
-                                                          ;   (println "explore1= status:" (:status tho) "message:" (:message tho)))
-                                                           (async/close! ch)))))]
-          (async/pipeline-async EXPLORE2_PARALLELS ch-reports-finish handler ch-areas)
-
-          (doseq [x (range startX (+ startX (:sizeX area)) 1)
-                  y (range startY (+ startY (:sizeY area)) 1)]
-            (>! ch-areas {:posX x :posY y :sizeX 1 :sizeY 1}))
-          (recur))
-        (recur)))
-
-    (go-loop []
-      (if-let [report (<! ch-reports-finish)]
-        (->area-queue *explore-reports-for-dig report))
-      (recur))
-
-    (dotimes [n DIG_PARALLELS]
-      (thread
-        (let [ch-local-treasures (chan)]
-
-          (async/pipe ch-local-treasures ch-treasures)
-
+  (dotimes [n EXPLORE_PARALLELS]
+    (future
+      (let [*monitor (atom 0)]
+        (letfn [(area-1x1?
+                  [{:keys [sizeX sizeY]}]
+                  (= 1 sizeX sizeY))
+                (process [{:keys [amount area]} end-callback]
+                  (let [{:keys [posX posY sizeX sizeY]} area
+                        areas (if (= sizeX sizeY)
+                                [{:posX posX :posY posY :sizeX (/ sizeX 2) :sizeY sizeY}
+                                 {:posX (+ posX (/ sizeX 2)) :posY posY :sizeX (/ sizeX 2) :sizeY sizeY}]
+                                [{:posX posX :posY posY :sizeX sizeX :sizeY (/ sizeY 2)}
+                                 {:posX posX :posY (+ posY (/ sizeY 2)) :sizeX sizeX :sizeY (/ sizeY 2)}])]
+                    (swap! *monitor inc)
+                    (postreq-explore {:data (first areas)
+                                      :success (fn [{:keys [body]}]
+                                                 (swap! *monitor dec)
+                                                 (let [current-amount (:amount body)
+                                                       remaining-amount (- amount current-amount)]
+                                                   (when (> current-amount 0)
+                                                     (end-callback body))
+                                                   (when (> remaining-amount 0)
+                                                     (end-callback {:amount remaining-amount
+                                                                    :area (second areas)}))))
+                                      :raise (fn [er]
+                                               (swap! *monitor dec))})))
+                (end-callback [resp]
+                  (if (area-1x1? (:area resp))
+                    (add-report-dig resp)
+                    (process resp end-callback)))]
           (loop []
-            (if-let [report (<-area-queue *explore-reports-for-dig)]
+            (when (zero? @*monitor)
+              (when-let [report (poll-report)]
+                (process report end-callback)))
+            (Thread/sleep 1)
+            (recur))))))
+
+  (dotimes [n DIG_PARALLELS]
+    (future
+      (let [*monitor (atom 0)]
+        (loop []
+          (if (and (dig-phase?)
+                   (zero? @*monitor))
+            (if-let [report (poll-report-dig)]
               (dig {:total-amount (:amount report)
                     :posX         (get-in report [:area :posX])
                     :posY         (get-in report [:area :posY])}
-                   ch-local-treasures)
-              (Thread/sleep 1))
-            (recur)))))
+                   *monitor))
+            (Thread/sleep 10))
+          (recur)))))
 
-    (let [ch-coins (chan)
-          handler (fn [{:keys [id depth]} ch]
-                    
-                    (postreq-cash id
-                                  (fn [{:keys [body request-time]}]
-                                    (go
-                                      (swap! *stat update :exchange-treasure-count (fnil inc 0))
-                                      (swap! *stat update (str "coint" depth) #(float (/ (+ (or % request-time) request-time) 2)))
-                                      (>! ch body)
-                                      (async/close! ch)))
-                                  (fn [ex]
-                                    ;(let [tho (slingshot.slingshot/get-thrown-object ex)]
-                                     ; (println "cash= status:" (:status tho) "message:" (:message tho)))
-                                    (async/close! ch))))]
-      (async/pipeline-async CASH_PARALLELS
-                            ch-coins
-                            handler
-                            ch-treasures)
-      (go-loop []
-        (let [coins (<! ch-coins)]
-          (swap! *coins into coins)
-          )
-        (recur)))))
+  (dotimes [n CASH_PARALLELS]
+    (future
+      (let [*monitor (atom 0)]
+        (loop []
+          (if (zero? @*monitor)
+            (when-let [{:keys [id depth]} (poll-treasure)]
+              (when (or (> depth 3) (< (count @*coins) 101))
+                (swap! *monitor inc)
+                (postreq-cash {:data id
+                               :success (fn [{:keys [body request-time]}]
+                                          (swap! *monitor dec)
+                                          (update-average-time (format "cash[%s]" depth) request-time)
+                                          (swap! *coins into body))
+                               :raise (fn [ex]
+                                        (swap! *monitor dec))}))
+
+              ))
+          (recur))))))
 
 (defn main [& opts]
-  (println "STEP1" STEP1
+  (println "STEP" STEP1
            "CASH_PARALLELS" CASH_PARALLELS
-           "EXPLORE1_PARALLELS" EXPLORE1_PARALLELS
-           "EXPLORE2_PARALLELS" EXPLORE2_PARALLELS
-           "DIG_PARALLELS" DIG_PARALLELS)  
+           "DIG_PARALLELS" DIG_PARALLELS
+           "EXPLORE_PARALLELS" EXPLORE_PARALLELS
+           "MIN_AMOUNT" MIN_AMOUNT
+           "LICENSES_TIMEOUT" LICENSES_TIMEOUT
+           "CONNECTION_TIMEOUT" CONNECTION_TIMEOUT)
 
   (run)
 
@@ -354,7 +438,7 @@
             (recur))))
 
 (comment
-  
+
   (main)
 
   )
